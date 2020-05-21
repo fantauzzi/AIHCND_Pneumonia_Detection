@@ -8,8 +8,8 @@
 # In[17]:
 
 
-import numpy as np  # linear algebra
-import pandas as pd  # data processing, CSV file I/O (e.g. pd.read_csv)
+import numpy as np
+import pandas as pd
 import os
 from glob import glob
 # get_ipython().run_line_magic('matplotlib', 'inline')
@@ -18,15 +18,20 @@ from sklearn.model_selection import train_test_split
 from sklearn.utils import shuffle
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, Flatten, Conv2D, MaxPooling2D
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.applications.vgg16 import VGG16
-from tensorflow.keras.applications.resnet import ResNet50
+# from tensorflow.keras.applications.resnet import ResNet50
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, LearningRateScheduler, EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.applications.vgg16 import preprocess_input
 from itertools import chain
+from math import ceil
+
+batch_size = 16
+validation_batch_size = 32
+epochs = 5
+augmentation_rate = 2
 
 ##Import any other stats/DL/ML packages you may need here. E.g. Keras, scikit-learn, etc.
 
@@ -43,7 +48,6 @@ from itertools import chain
 # Check there is a GPU available
 n_gpus = len(tf.config.experimental.list_physical_devices('GPU'))
 assert n_gpus >= 1
-
 
 dataset_root = '/media/fanta/52A80B61A80B42C9/Users/fanta/datasets'
 pd.set_option('display.max_rows', 100)
@@ -133,20 +137,20 @@ def my_image_augmentation(vargs):
     return my_idg
 
 
-def make_train_gen(train_df, dataset_root):
+def make_train_gen(train_df, dataset_root, batch_size):
     ## Create the actual generators using the output of my_image_augmentation for your training data
     ## Suggestion here to use the flow_from_dataframe library, e.g.:
 
     # TODO should I zero center the images? See https://www.tensorflow.org/api_docs/python/tf/keras/applications/vgg16/preprocess_input
 
-    idg = ImageDataGenerator(rescale=1. / 255.0,
-                             horizontal_flip=True,
+    idg = ImageDataGenerator(horizontal_flip=True,  # rescale=1./255
                              vertical_flip=False,
-                             height_shift_range=0.1,
-                             width_shift_range=0.1,
-                             rotation_range=20,
+                             height_shift_range=.0,
+                             width_shift_range=.0,
+                             rotation_range=10,
                              shear_range=0.1,
-                             zoom_range=0.1)
+                             zoom_range=0.1,
+                             preprocessing_function=preprocess_input)
 
     train_gen = idg.flow_from_dataframe(dataframe=train_df,
                                         directory=dataset_root,
@@ -154,13 +158,13 @@ def make_train_gen(train_df, dataset_root):
                                         y_col='Pneumonia',
                                         class_mode='raw',  # TODO should I use binarty instead?
                                         target_size=(224, 224),  # Input size for VGG16
-                                        batch_size=32
+                                        batch_size=batch_size
                                         )
 
     return train_gen
 
 
-def make_val_gen(val_df, dataset_root):
+def make_val_gen(val_df, dataset_root, batch_size):
     #     val_gen = my_val_idg.flow_from_dataframe(dataframe = val_data,
     #                                              directory=None,
     #                                              x_col = ,
@@ -170,7 +174,8 @@ def make_val_gen(val_df, dataset_root):
     #                                              batch_size = )
 
     # Todo
-    idg = ImageDataGenerator(rescale=1. / 255.0)
+    # idg = ImageDataGenerator(rescale=1. / 255.0)
+    idg = ImageDataGenerator(preprocessing_function=preprocess_input)
 
     val_gen = idg.flow_from_dataframe(dataframe=val_df,
                                       directory=dataset_root,
@@ -178,7 +183,7 @@ def make_val_gen(val_df, dataset_root):
                                       y_col='Pneumonia',
                                       class_mode='raw',  # TODO should I use binarty instead?
                                       target_size=(224, 224),  # Input size for VGG16
-                                      batch_size=32
+                                      batch_size=batch_size
                                       )
 
     return val_gen
@@ -186,18 +191,25 @@ def make_val_gen(val_df, dataset_root):
 
 # In[ ]:
 
+def enforce_classes_ratio(dataset_df, ratio):
+    # Reduce the training set removing enough negative cases to remain with a training set with 50% positive and 50% negative
+    count_train_pos = sum(dataset_df.Pneumonia)
+
+    res_df = dataset_df[dataset_df.Pneumonia == 0][:int(count_train_pos * ratio)].append(
+        dataset_df[dataset_df.Pneumonia == 1])
+    res_df = shuffle(res_df)
+    res_df.reset_index(inplace=True, drop=True)
+    return res_df
+
+
 train_df, test_df = create_splits(all_xray_df)
 # Reduce the training set removing enough negative cases to remain with a training set with 50% positive and 50% negative
-count_train_pos = sum(train_df.Pneumonia)
-assert count_train_pos < len(train_df) // 2
 
-train_df = train_df[train_df.Pneumonia == 0][:count_train_pos].append(train_df[train_df.Pneumonia == 1])
-train_df = shuffle(train_df)
-train_df.reset_index(inplace=True, drop=True)
+train_df = enforce_classes_ratio(train_df, 1)
+test_df = enforce_classes_ratio(test_df, 3)
 
 ## May want to pull a single large batch of random validation data for testing after each epoch:
-val_gen = make_val_gen(test_df, dataset_root)
-valX, valY = val_gen.next()
+val_gen = make_val_gen(test_df, dataset_root, validation_batch_size)
 
 # In[ ]:
 
@@ -206,9 +218,9 @@ valX, valY = val_gen.next()
 ## This is helpful for understanding the extent to which data is being manipulated prior to training, 
 ## and can be compared with how the raw data look prior to augmentation
 
-train_gen = make_train_gen(train_df, dataset_root)
+train_gen = make_train_gen(train_df, dataset_root, batch_size)
 
-t_x, t_y = next(train_gen)
+"""t_x, t_y = next(train_gen)
 fig, m_axs = plt.subplots(4, 4, figsize=(16, 16))
 for (c_x, c_y, c_ax) in zip(t_x, t_y, m_axs.flatten()):
     c_ax.imshow(c_x[:, :, 0], cmap='bone')
@@ -218,7 +230,7 @@ for (c_x, c_y, c_ax) in zip(t_x, t_y, m_axs.flatten()):
         c_ax.set_title('No Pneumonia')
     c_ax.axis('off')
 
-plt.show()
+plt.show()"""
 
 # ## Build your model: 
 # 
@@ -232,6 +244,9 @@ model.summary()
 transfer_layer = model.get_layer('block5_pool')
 vgg_model = Model(inputs=model.input,
                   outputs=transfer_layer.output)
+
+for layer in vgg_model.layers[0:17]:
+    layer.trainable = False
 
 for layer in vgg_model.layers:
     print(layer.name, layer.trainable)
@@ -252,18 +267,58 @@ new_model.add(Dense(1, activation='sigmoid'))
 
 ## Set our optimizer, loss function, and learning rate
 optimizer = Adam(lr=1e-4)
-loss = 'binary_crossentropy'
-metrics = ['binary_accuracy']
+loss = tf.keras.losses.BinaryCrossentropy()
+metrics = [tf.keras.metrics.BinaryAccuracy(), tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
+
+new_model.summary()
 
 new_model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
 
-## Just run a single epoch to see how it does:
-# TODO fit_generator is deprecated, replace with fit()
-new_model.fit_generator(train_gen,
-                        validation_data=(valX, valY),
-                        epochs=5)
+steps_per_epoch = ceil(len(train_df) / batch_size) * augmentation_rate
+# steps_per_epoch = 10
+validation_steps = ceil(len(test_df) / validation_batch_size)
+# validation_steps = 10
+history = new_model.fit(x=train_gen,
+                        steps_per_epoch=steps_per_epoch,
+                        validation_data=val_gen,
+                        validation_steps=validation_steps,
+                        epochs=epochs)
 
-summy = 42
+
+# Define a function here that will plot loss, val_loss, binary_accuracy, and val_binary_accuracy over all of
+# your epochs:
+def plot_history(history):
+    n_epochs = len(history.history["loss"])
+    train_precision = np.array(history.history['precision'])
+    train_recall = np.array(history.history['recall'])
+    val_precision = np.array(history.history['val_precision'])
+    val_recall = np.array(history.history['val_recall'])
+    train_F1 = 2. * (train_precision * train_recall) / (
+            train_precision + train_recall)
+    val_F1 = 2. * (val_precision * val_recall) / (val_precision + val_recall)
+
+    _, ax1 = plt.subplots()
+    ax1.set_title('Training and Validation Metrics')
+
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.set_xticks(range(n_epochs))
+    ax1.plot(np.arange(0, n_epochs), history.history["loss"], label="Train. loss", color='greenyellow')
+    ax1.plot(np.arange(0, n_epochs), history.history["val_loss"], label="Val. loss", color='darkolivegreen')
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('F1')
+    ax2.set_xticks(range(n_epochs))
+    ax2.plot(np.arange(0, n_epochs), train_F1, label="Train. F1", color='magenta')
+    ax2.plot(np.arange(0, n_epochs), val_F1, label="Val. F1", color='darkmagenta')
+
+    ax1.legend(loc='center left')
+    ax2.legend(loc='center right')
+
+
+plot_history(history)
+plt.show()
+
 
 def load_pretrained_model(vargs):
     # model = VGG16(include_top=True, weights='imagenet')
@@ -373,12 +428,6 @@ def plot_auc(t_y, p_y):
 
 # def ...
 # Todo
-
-# Also consider plotting the history of your model training:
-
-def plot_history(history):
-    # Todo
-    return
 
 
 # In[ ]:
