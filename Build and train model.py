@@ -17,6 +17,7 @@ from tensorflow.keras.applications.vgg16 import VGG16
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, LearningRateScheduler, EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.applications.vgg16 import preprocess_input
+from tensorflow.keras.initializers import GlorotNormal
 from itertools import chain
 from math import ceil
 from tqdm import tqdm
@@ -25,7 +26,7 @@ batch_size = 16  # Used for training
 validation_batch_size = 64
 initial_epoch = 0  # Used to resume training from a saved set of weights, if available
 n_epochs = 10  # Max number of epochs for training during the current run (i.e. counting after initial_epoch)
-augmentation_rate = 1  # Number of synthetic images that will be produced for every positive image in the dataset
+augmentation_rate = 4  # Number of synthetic images that will be produced for every positive image in the dataset
 dataset_root = '/media/fanta/52A80B61A80B42C9/Users/fanta/datasets'
 augmentation_dir = dataset_root + '/data/augmented'  # TODO make it portable
 augmentation_batch_size = 229  # A divisor of 2290, the number of positive images in the dataset
@@ -61,7 +62,6 @@ def create_splits(data):
     train_data, val_data = train_test_split(data,
                                             test_size=.2,
                                             stratify=data['Pneumonia'],
-                                            random_state=42,
                                             shuffle=True)
 
     return train_data, val_data
@@ -96,13 +96,13 @@ test_df = enforce_classes_ratio(test_df, 3)
 def make_augmented_positive_images(dataset_df, augmentation_dir, augmentation_batch_size, augmentation_rate):
     to_be_augmented = dataset_df[dataset_df.Pneumonia == 1]
 
-    augmented_idg = ImageDataGenerator(horizontal_flip=True,
+    augmented_idg = ImageDataGenerator(horizontal_flip=False,
                                        vertical_flip=False,
-                                       height_shift_range=.05,
-                                       width_shift_range=.0,
-                                       rotation_range=5,
-                                       shear_range=0.1,
-                                       zoom_range=0.15)
+                                       height_shift_range=.1,
+                                       width_shift_range=.05,
+                                       rotation_range=7,
+                                       shear_range=0.2,
+                                       zoom_range=0.25)
 
     augmentation_gen = augmented_idg.flow_from_dataframe(dataframe=to_be_augmented,
                                                          directory=dataset_root,
@@ -148,7 +148,8 @@ def make_train_gen(train_df, dataset_root, batch_size):
                                         y_col='Pneumonia',
                                         class_mode='raw',  # TODO should I use binary instead?
                                         target_size=(224, 224),  # Input size for VGG16
-                                        batch_size=batch_size
+                                        batch_size=batch_size,
+                                        shuffle=True
                                         )
 
     return train_gen
@@ -163,7 +164,8 @@ def make_val_gen(val_df, dataset_root, batch_size):
                                       y_col='Pneumonia',
                                       class_mode='raw',  # TODO should I use binary instead?
                                       target_size=(224, 224),  # Input size for VGG16
-                                      batch_size=batch_size
+                                      batch_size=batch_size,
+                                      shuffle=True
                                       )
 
     return val_gen
@@ -208,10 +210,14 @@ retrofitted_model.add(vgg_model)
 # convolutional layer.
 retrofitted_model.add(Flatten())
 
-# Add a dense (aka. fully-connected) layer.
-# This is for combining features that the VGG16 model has
-# recognized in the image.
-retrofitted_model.add(Dense(1, activation='sigmoid'))
+"""retrofitted_model.add(Dropout(0.4))
+retrofitted_model.add(Dense(1024, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+retrofitted_model.add(Dropout(0.4))
+retrofitted_model.add(Dense(512, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+retrofitted_model.add(Dropout(0.4))
+retrofitted_model.add(Dense(256, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))"""
+retrofitted_model.add(Dense(1, activation='sigmoid', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+
 retrofitted_model.summary()
 
 positive_training_count = sum(train_df.Pneumonia)
@@ -240,7 +246,7 @@ if len(all_weights_paths) > 0:
     initial_epoch = int(latest_and_greatest[8:12])
     print('Resuming with epoch', initial_epoch + 1, 'from weights previously saved in', latest_and_greatest)
 
-optimizer = Adam(lr=1e-4)  # TODO Check against paper
+optimizer = Adam(lr=1e-4)
 loss = tf.keras.losses.BinaryCrossentropy()
 metrics = [tf.keras.metrics.BinaryAccuracy(), tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
 
