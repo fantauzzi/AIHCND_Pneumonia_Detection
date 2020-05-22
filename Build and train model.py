@@ -23,10 +23,10 @@ from math import ceil
 from tqdm import tqdm
 
 batch_size = 16  # Used for training
-validation_batch_size = 64
+validation_batch_size = 85
 initial_epoch = 0  # Used to resume training from a saved set of weights, if available
 n_epochs = 10  # Max number of epochs for training during the current run (i.e. counting after initial_epoch)
-augmentation_rate = 4  # Number of synthetic images that will be produced for every positive image in the dataset
+augmentation_rate = 0  # Number of synthetic images that will be produced for every image in the training dataset
 dataset_root = '/media/fanta/52A80B61A80B42C9/Users/fanta/datasets'
 augmentation_dir = dataset_root + '/data/augmented'  # TODO make it portable
 augmentation_batch_size = 229  # A divisor of 2290, the number of positive images in the dataset
@@ -58,16 +58,39 @@ for c_label in all_labels:
 
 # all_xray_df.sample(10)
 
-def create_splits(data):
+def split_dataset(dataset, test_size):
+    patient_id = 'Patient ID'
+    pneumonia = 'Pneumonia'
+    # For each patient, count how many positive samples in the dataset, and shuffle the resulting serie
+    patient_positive_count = shuffle(all_xray_df.groupby(patient_id)[pneumonia].agg('sum'))
+    n_positive_samples = sum(dataset[pneumonia])
+    n_wanted = int(n_positive_samples * test_size)
+    selected_patients = set()
+    n_selected = 0
+    for id, count in patient_positive_count.items():
+        selected_patients.add(id)
+        n_selected += count
+        if n_selected > n_wanted:
+            break
+    test_set = shuffle(dataset[dataset[patient_id].isin(selected_patients)])
+    training_set = shuffle(dataset[~dataset[patient_id].isin(selected_patients)])
+    assert len(training_set) + len(test_set) == len(dataset)
+    return training_set, test_set
+
+
+"""def create_splits(data):
     train_data, val_data = train_test_split(data,
                                             test_size=.2,
                                             stratify=data['Pneumonia'],
                                             shuffle=True)
 
-    return train_data, val_data
+    return train_data, val_data"""
 
+train_df, test_df = split_dataset(all_xray_df, .2)
 
-train_df, test_df = create_splits(all_xray_df)
+train_pos = sum(train_df.Pneumonia)
+train_neg = len(train_df.Pneumonia) - train_pos
+class_weight = {1: float(train_neg) / (train_pos + train_neg), 0: float(train_pos) / (train_pos + train_neg)}
 
 
 def enforce_classes_ratio(dataset_df, ratio):
@@ -82,8 +105,8 @@ def enforce_classes_ratio(dataset_df, ratio):
 
 
 # Reduce the training set removing enough negative cases to remain with a training set with 50% positive and 50% negative
-train_df = enforce_classes_ratio(train_df, 1 + augmentation_rate)
-test_df = enforce_classes_ratio(test_df, 3)
+# train_df = enforce_classes_ratio(train_df, 1 + augmentation_rate)
+# test_df = enforce_classes_ratio(test_df, 3)
 
 
 # In[ ]:
@@ -124,19 +147,19 @@ def make_augmented_positive_images(dataset_df, augmentation_dir, augmentation_ba
         augmentation_gen.next()
 
 
-if len(glob(os.path.join(augmentation_dir + '/*.png'))) == 0 and augmentation_rate != 0:
-    make_augmented_positive_images(train_df, augmentation_dir, augmentation_batch_size, augmentation_rate)
+"""if len(glob(os.path.join(augmentation_dir + '/*.png'))) == 0 and augmentation_rate != 0:
+    make_augmented_positive_images(train_df, augmentation_dir, augmentation_batch_size, augmentation_rate)"""
 
 # Add augmented images to the training set
-all_image_paths = {os.path.basename(x): x for x in
+"""all_image_paths = {os.path.basename(x): x for x in
                    glob(os.path.join(augmentation_dir + '/*.png'))}
 
 all_1 = [1] * len(all_image_paths)
 additional_df = pd.DataFrame(data={'path': list(all_image_paths.values()), 'Pneumonia': all_1})
 # additional_df['path'] = all_image_paths
 train_df = train_df.append(additional_df)
-print('Loaded',len(additional_df),'synthetic positive samples, added to training set.')
-print('Augmentation rate is set to',augmentation_rate,'synthetic image(s) for every positive sample in training set.')
+print('Loaded', len(additional_df), 'synthetic positive samples, added to training set.')
+print('Augmentation rate is set to', augmentation_rate, 'synthetic image(s) for every positive sample in training set.')"""
 
 
 def make_train_gen(train_df, dataset_root, batch_size):
@@ -216,24 +239,13 @@ retrofitted_model.add(Dropout(0.4))
 retrofitted_model.add(Dense(512, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
 retrofitted_model.add(Dropout(0.4))
 retrofitted_model.add(Dense(256, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))"""
-retrofitted_model.add(Dense(1, activation='sigmoid', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+retrofitted_model.add(
+    Dense(1, activation='sigmoid', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
 
 retrofitted_model.summary()
 
 positive_training_count = sum(train_df.Pneumonia)
 positive_validation_count = sum(test_df.Pneumonia)
-
-print()
-print('Training Set ---------------------------------')
-print('Positive samples, total {}'.format(positive_training_count))
-print('Positive samples, synthetic {}'.format(len(additional_df)))
-print('Positive samples, non-synthetic {}'.format(positive_training_count-len(additional_df)))
-print('Negative samples {}'.format(len(train_df)-positive_training_count))
-print('Validation Set -------------------------------')
-print('Positive samples {}'.format(positive_validation_count))
-print('Negative samples {}'.format(len(test_df)-positive_validation_count))
-print('----------------------------------------------')
-print()
 
 all_weights_paths = {os.path.basename(x): x for x in
                      glob(os.path.join('weights', 'weights*.hdf5'))}
@@ -264,11 +276,26 @@ early = EarlyStopping(monitor='val_loss',
 
 callbacks_list = [checkpoint, early]
 
-steps_per_epoch = ceil(len(train_df) / batch_size)
-# steps_per_epoch = 10
-validation_steps = ceil(len(test_df) / validation_batch_size)
-# validation_steps = 10
+steps_per_epoch = ceil(len(train_df) * (1. + augmentation_rate) / batch_size)
+validation_steps = ceil(float(len(test_df)) / validation_batch_size)
+
+print()
+print('Training Set ---------------------------------')
+print('Positive samples {}'.format(positive_training_count))
+print('Negative samples {}'.format(len(train_df) - positive_training_count))
+print('Total samples {}'.format(len(train_df)))
+print('Total samples after augmentation {}'.format(steps_per_epoch*batch_size))
+print('Validation Set -------------------------------')
+print('Positive samples {}'.format(positive_validation_count))
+print('Negative samples {}'.format(len(test_df) - positive_validation_count))
+print('Total samples in batches {}'.format(validation_steps*validation_batch_size))
+print('----------------------------------------------')
+print()
+
+
+
 history = retrofitted_model.fit(x=train_gen,
+                                class_weight=class_weight,
                                 steps_per_epoch=steps_per_epoch,
                                 validation_data=val_gen,
                                 validation_steps=validation_steps,
@@ -338,7 +365,6 @@ def build_my_model(vargs):
     # Todo
 
     return None
-
 
 
 ## STAND-OUT Suggestion: choose another output layer besides just the last classification layer of your modele
