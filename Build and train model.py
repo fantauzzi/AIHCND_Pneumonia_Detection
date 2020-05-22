@@ -1,13 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# ## Skeleton Code
-# 
-# The code below provides a skeleton for the model building & training component of your project. You can add/remove/build on code however you see fit, this is meant as a starting point.
-
-# In[17]:
-
-
 import numpy as np
 import pandas as pd
 import os
@@ -21,91 +14,50 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, Flatten, Conv2D, MaxPooling2D
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.applications.vgg16 import VGG16
-# from tensorflow.keras.applications.resnet import ResNet50
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, LearningRateScheduler, EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.applications.vgg16 import preprocess_input
 from itertools import chain
 from math import ceil
+from tqdm import tqdm
 
-batch_size = 16
-validation_batch_size = 32
-epochs = 5
-augmentation_rate = 2
-
-##Import any other stats/DL/ML packages you may need here. E.g. Keras, scikit-learn, etc.
-
-
-# ## Do some early processing of your metadata for easier model training:
-
-# In[18]:
-
-# Hack to prevent TF from allocating the whole GPU memory at start-up
-# config = tf.compat.v1.ConfigProto()
-# config.gpu_options.allow_growth = True
-# sess = tf.compat.v1.Session(config=config)
+batch_size = 16  # Used for training
+validation_batch_size = 64
+initial_epoch = 0  # Used to resume training from a saved set of weights, if available
+n_epochs = 10  # Max number of epochs for training during the current run (i.e. counting after initial_epoch)
+augmentation_rate = 1  # Number of synthetic images that will be produced for every positive image in the dataset
+dataset_root = '/media/fanta/52A80B61A80B42C9/Users/fanta/datasets'
+augmentation_dir = dataset_root + '/data/augmented'  # TODO make it portable
+augmentation_batch_size = 229  # A divisor of 2290, the number of positive images in the dataset
+weight_path = 'weights/weights.{epoch:04d}-{val_loss:.2f}.hdf5'
+pd.set_option('display.max_rows', 100)
 
 # Check there is a GPU available
 n_gpus = len(tf.config.experimental.list_physical_devices('GPU'))
 assert n_gpus >= 1
 
-dataset_root = '/media/fanta/52A80B61A80B42C9/Users/fanta/datasets'
-pd.set_option('display.max_rows', 100)
-
-# In[19]:
-
-
+# Read the dataset metadata
 all_xray_df = pd.read_csv(dataset_root + '/data/Data_Entry_2017.csv')
 all_xray_df = all_xray_df.drop(columns=all_xray_df.columns[-1])
-all_xray_df.sample(10)
+# all_xray_df.sample(10)
 
-# In[20]:
-
-
-## Below is some helper code to read all of your full image filepaths into a dataframe for easier manipulation
-
-# all_xray_df = pd.read_csv(dataset_root+'/data/Data_Entry_2017.csv')
+# Add a 'path' column to the metadata dataframe holding the full path to dataset images
 all_image_paths = {os.path.basename(x): x for x in
                    glob(os.path.join(dataset_root + '/data', 'images*', '*', '*.png'))}
 print('Scans found:', len(all_image_paths), ', Total Headers', all_xray_df.shape[0])
 all_xray_df['path'] = all_xray_df['Image Index'].map(all_image_paths.get)
-all_xray_df.sample(3)
-
-# In[21]:
+# l_xray_df.sample(3)
 
 
-## Here you may want to create some extra columns in your table with binary indicators of certain diseases 
-## rather than working directly with the 'Finding Labels' column
-
-# Todo
+# One-hot encode the findings for each row in the metadata dataframe, adding more columns as needed
 all_labels = np.unique(list(chain(*all_xray_df['Finding Labels'].map(lambda x: x.split('|')).tolist())))
 for c_label in all_labels:
     all_xray_df[c_label] = all_xray_df['Finding Labels'].map(lambda finding: 1 if c_label in finding else 0)
-all_xray_df.sample(10)
 
 
-# In[ ]:
-
-
-## Here we can create a new column called 'pneumonia_class' that will allow us to look at 
-## images with or without pneumonia for binary classification
-
-# Todo
-
-
-# ## Create your training and testing data:
-
-# In[ ]:
-
+# all_xray_df.sample(10)
 
 def create_splits(data):
-    ## Either build your own or use a built-in library to split your original dataframe into two sets
-    ## that can be used for training and testing your model
-    ## It's important to consider here how balanced or imbalanced you want each of those sets to be
-    ## for the presence of pneumonia
-
-    # Todo
-
     train_data, val_data = train_test_split(data,
                                             test_size=.2,
                                             stratify=data['Pneumonia'],
@@ -115,81 +67,8 @@ def create_splits(data):
     return train_data, val_data
 
 
-# # Now we can begin our model-building & training
+train_df, test_df = create_splits(all_xray_df)
 
-# #### First suggestion: perform some image augmentation on your data
-
-# In[ ]:
-
-
-def my_image_augmentation(vargs):
-    ## recommendation here to implement a package like Keras' ImageDataGenerator
-    ## with some of the built-in augmentations 
-
-    ## keep an eye out for types of augmentation that are or are not appropriate for medical imaging data
-    ## Also keep in mind what sort of augmentation is or is not appropriate for testing vs validation data
-
-    ## STAND-OUT SUGGESTION: implement some of your own custom augmentation that's *not*
-    ## built into something like a Keras package
-
-    # Todo
-
-    return my_idg
-
-
-def make_train_gen(train_df, dataset_root, batch_size):
-    ## Create the actual generators using the output of my_image_augmentation for your training data
-    ## Suggestion here to use the flow_from_dataframe library, e.g.:
-
-    # TODO should I zero center the images? See https://www.tensorflow.org/api_docs/python/tf/keras/applications/vgg16/preprocess_input
-
-    idg = ImageDataGenerator(horizontal_flip=True,  # rescale=1./255
-                             vertical_flip=False,
-                             height_shift_range=.0,
-                             width_shift_range=.0,
-                             rotation_range=10,
-                             shear_range=0.1,
-                             zoom_range=0.1,
-                             preprocessing_function=preprocess_input)
-
-    train_gen = idg.flow_from_dataframe(dataframe=train_df,
-                                        directory=dataset_root,
-                                        x_col='path',
-                                        y_col='Pneumonia',
-                                        class_mode='raw',  # TODO should I use binarty instead?
-                                        target_size=(224, 224),  # Input size for VGG16
-                                        batch_size=batch_size
-                                        )
-
-    return train_gen
-
-
-def make_val_gen(val_df, dataset_root, batch_size):
-    #     val_gen = my_val_idg.flow_from_dataframe(dataframe = val_data,
-    #                                              directory=None,
-    #                                              x_col = ,
-    #                                              y_col = ',
-    #                                              class_mode = 'binary',
-    #                                              target_size = ,
-    #                                              batch_size = )
-
-    # Todo
-    # idg = ImageDataGenerator(rescale=1. / 255.0)
-    idg = ImageDataGenerator(preprocessing_function=preprocess_input)
-
-    val_gen = idg.flow_from_dataframe(dataframe=val_df,
-                                      directory=dataset_root,
-                                      x_col='path',
-                                      y_col='Pneumonia',
-                                      class_mode='raw',  # TODO should I use binarty instead?
-                                      target_size=(224, 224),  # Input size for VGG16
-                                      batch_size=batch_size
-                                      )
-
-    return val_gen
-
-
-# In[ ]:
 
 def enforce_classes_ratio(dataset_df, ratio):
     # Reduce the training set removing enough negative cases to remain with a training set with 50% positive and 50% negative
@@ -202,14 +81,10 @@ def enforce_classes_ratio(dataset_df, ratio):
     return res_df
 
 
-train_df, test_df = create_splits(all_xray_df)
 # Reduce the training set removing enough negative cases to remain with a training set with 50% positive and 50% negative
-
-train_df = enforce_classes_ratio(train_df, 1)
+train_df = enforce_classes_ratio(train_df, 1 + augmentation_rate)
 test_df = enforce_classes_ratio(test_df, 3)
 
-## May want to pull a single large batch of random validation data for testing after each epoch:
-val_gen = make_val_gen(test_df, dataset_root, validation_batch_size)
 
 # In[ ]:
 
@@ -218,7 +93,84 @@ val_gen = make_val_gen(test_df, dataset_root, validation_batch_size)
 ## This is helpful for understanding the extent to which data is being manipulated prior to training, 
 ## and can be compared with how the raw data look prior to augmentation
 
+def make_augmented_positive_images(dataset_df, augmentation_dir, augmentation_batch_size, augmentation_rate):
+    to_be_augmented = dataset_df[dataset_df.Pneumonia == 1]
+
+    augmented_idg = ImageDataGenerator(horizontal_flip=True,
+                                       vertical_flip=False,
+                                       height_shift_range=.05,
+                                       width_shift_range=.0,
+                                       rotation_range=5,
+                                       shear_range=0.1,
+                                       zoom_range=0.15)
+
+    augmentation_gen = augmented_idg.flow_from_dataframe(dataframe=to_be_augmented,
+                                                         directory=dataset_root,
+                                                         x_col='path',
+                                                         y_col='Pneumonia',
+                                                         class_mode='raw',  # TODO should I use binary instead?
+                                                         target_size=(224, 224),  # Input size for VGG16
+                                                         interpolation='bilinear',
+                                                         save_to_dir=augmentation_dir,
+                                                         save_prefix='augmented',
+                                                         save_format='png',
+                                                         batch_size=augmentation_batch_size)
+
+    how_many_wanted = augmentation_rate * len(to_be_augmented)
+    how_many_batches = how_many_wanted // augmentation_batch_size
+    print('Generating', how_many_batches, 'batches of', augmentation_batch_size, 'synthetic positive images each.',
+          flush=True)
+    for i in tqdm(range(how_many_batches)):
+        augmentation_gen.next()
+
+
+if len(glob(os.path.join(augmentation_dir + '/*.png'))) == 0 and augmentation_rate != 0:
+    make_augmented_positive_images(train_df, augmentation_dir, augmentation_batch_size, augmentation_rate)
+
+# Add augmented images to the training set
+all_image_paths = {os.path.basename(x): x for x in
+                   glob(os.path.join(augmentation_dir + '/*.png'))}
+
+all_1 = [1] * len(all_image_paths)
+additional_df = pd.DataFrame(data={'path': list(all_image_paths.values()), 'Pneumonia': all_1})
+# additional_df['path'] = all_image_paths
+train_df = train_df.append(additional_df)
+print('Loaded',len(additional_df),'synthetic positive samples, added to training set.')
+print('Augmentation rate is set to',augmentation_rate,'synthetic image(s) for every positive sample in training set.')
+
+
+def make_train_gen(train_df, dataset_root, batch_size):
+    idg = ImageDataGenerator(preprocessing_function=preprocess_input)
+
+    train_gen = idg.flow_from_dataframe(dataframe=train_df,
+                                        directory=dataset_root,
+                                        x_col='path',
+                                        y_col='Pneumonia',
+                                        class_mode='raw',  # TODO should I use binary instead?
+                                        target_size=(224, 224),  # Input size for VGG16
+                                        batch_size=batch_size
+                                        )
+
+    return train_gen
+
+
+def make_val_gen(val_df, dataset_root, batch_size):
+    idg = ImageDataGenerator(preprocessing_function=preprocess_input)
+
+    val_gen = idg.flow_from_dataframe(dataframe=val_df,
+                                      directory=dataset_root,
+                                      x_col='path',
+                                      y_col='Pneumonia',
+                                      class_mode='raw',  # TODO should I use binary instead?
+                                      target_size=(224, 224),  # Input size for VGG16
+                                      batch_size=batch_size
+                                      )
+
+    return val_gen
+
+
 train_gen = make_train_gen(train_df, dataset_root, batch_size)
+val_gen = make_val_gen(test_df, dataset_root, validation_batch_size)
 
 """t_x, t_y = next(train_gen)
 fig, m_axs = plt.subplots(4, 4, figsize=(16, 16))
@@ -232,17 +184,13 @@ for (c_x, c_y, c_ax) in zip(t_x, t_y, m_axs.flatten()):
 
 plt.show()"""
 
-# ## Build your model: 
-# 
-# Recommendation here to use a pre-trained network downloaded from Keras for fine-tuning
+# Build the model
 
-# In[ ]:
+base_model = VGG16(include_top=True, weights='imagenet')
+base_model.summary()
 
-model = VGG16(include_top=True, weights='imagenet')
-model.summary()
-
-transfer_layer = model.get_layer('block5_pool')
-vgg_model = Model(inputs=model.input,
+transfer_layer = base_model.get_layer('block5_pool')
+vgg_model = Model(inputs=base_model.input,
                   outputs=transfer_layer.output)
 
 for layer in vgg_model.layers[0:17]:
@@ -251,44 +199,82 @@ for layer in vgg_model.layers[0:17]:
 for layer in vgg_model.layers:
     print(layer.name, layer.trainable)
 
-new_model = Sequential()
+retrofitted_model = Sequential()
 
 # Add the convolutional part of the VGG16 model from above.
-new_model.add(vgg_model)
+retrofitted_model.add(vgg_model)
 
 # Flatten the output of the VGG16 model because it is from a
 # convolutional layer.
-new_model.add(Flatten())
+retrofitted_model.add(Flatten())
 
 # Add a dense (aka. fully-connected) layer.
 # This is for combining features that the VGG16 model has
 # recognized in the image.
-new_model.add(Dense(1, activation='sigmoid'))
+retrofitted_model.add(Dense(1, activation='sigmoid'))
+retrofitted_model.summary()
 
-## Set our optimizer, loss function, and learning rate
-optimizer = Adam(lr=1e-4)
+positive_training_count = sum(train_df.Pneumonia)
+positive_validation_count = sum(test_df.Pneumonia)
+
+print()
+print('Training Set ---------------------------------')
+print('Positive samples, total {}'.format(positive_training_count))
+print('Positive samples, synthetic {}'.format(len(additional_df)))
+print('Positive samples, non-synthetic {}'.format(positive_training_count-len(additional_df)))
+print('Negative samples {}'.format(len(train_df)-positive_training_count))
+print('Validation Set -------------------------------')
+print('Positive samples {}'.format(positive_validation_count))
+print('Negative samples {}'.format(len(test_df)-positive_validation_count))
+print('----------------------------------------------')
+print()
+
+all_weights_paths = {os.path.basename(x): x for x in
+                     glob(os.path.join('weights', 'weights*.hdf5'))}
+
+# TODO latest = tf.train.latest_checkpoint(checkpoint_dir)
+
+if len(all_weights_paths) > 0:
+    latest_and_greatest = max(all_weights_paths.keys())
+    retrofitted_model.load_weights(all_weights_paths[latest_and_greatest])
+    initial_epoch = int(latest_and_greatest[8:12])
+    print('Resuming with epoch', initial_epoch + 1, 'from weights previously saved in', latest_and_greatest)
+
+optimizer = Adam(lr=1e-4)  # TODO Check against paper
 loss = tf.keras.losses.BinaryCrossentropy()
 metrics = [tf.keras.metrics.BinaryAccuracy(), tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
 
-new_model.summary()
+retrofitted_model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
 
-new_model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+checkpoint = ModelCheckpoint(weight_path,
+                             monitor='val_loss',
+                             verbose=1,
+                             save_best_only=False,
+                             save_weights_only=True)
 
-steps_per_epoch = ceil(len(train_df) / batch_size) * augmentation_rate
+early = EarlyStopping(monitor='val_loss',
+                      mode='min',
+                      patience=16)
+
+callbacks_list = [checkpoint, early]
+
+steps_per_epoch = ceil(len(train_df) / batch_size)
 # steps_per_epoch = 10
 validation_steps = ceil(len(test_df) / validation_batch_size)
 # validation_steps = 10
-history = new_model.fit(x=train_gen,
-                        steps_per_epoch=steps_per_epoch,
-                        validation_data=val_gen,
-                        validation_steps=validation_steps,
-                        epochs=epochs)
+history = retrofitted_model.fit(x=train_gen,
+                                steps_per_epoch=steps_per_epoch,
+                                validation_data=val_gen,
+                                validation_steps=validation_steps,
+                                initial_epoch=initial_epoch,
+                                epochs=initial_epoch + n_epochs,
+                                callbacks=callbacks_list)
 
 
 # Define a function here that will plot loss, val_loss, binary_accuracy, and val_binary_accuracy over all of
 # your epochs:
 def plot_history(history):
-    n_epochs = len(history.history["loss"])
+    epochs = [i + 1 for i in history.epoch]
     train_precision = np.array(history.history['precision'])
     train_recall = np.array(history.history['recall'])
     val_precision = np.array(history.history['val_precision'])
@@ -302,15 +288,15 @@ def plot_history(history):
 
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Loss')
-    ax1.set_xticks(range(n_epochs))
-    ax1.plot(np.arange(0, n_epochs), history.history["loss"], label="Train. loss", color='greenyellow')
-    ax1.plot(np.arange(0, n_epochs), history.history["val_loss"], label="Val. loss", color='darkolivegreen')
+    ax1.set_xticks(epochs)
+    ax1.plot(epochs, history.history["loss"], label="Train. loss", color='greenyellow')
+    ax1.plot(epochs, history.history["val_loss"], label="Val. loss", color='darkolivegreen')
 
     ax2 = ax1.twinx()
     ax2.set_ylabel('F1')
-    ax2.set_xticks(range(n_epochs))
-    ax2.plot(np.arange(0, n_epochs), train_F1, label="Train. F1", color='magenta')
-    ax2.plot(np.arange(0, n_epochs), val_F1, label="Val. F1", color='darkmagenta')
+    ax2.set_xticks(epochs)
+    ax2.plot(epochs, train_F1, label="Train. F1", color='magenta')
+    ax2.plot(epochs, val_F1, label="Val. F1", color='darkmagenta')
 
     ax1.legend(loc='center left')
     ax2.legend(loc='center right')
@@ -345,7 +331,8 @@ def build_my_model(vargs):
 
     # Todo
 
-    return my_model
+    return None
+
 
 
 ## STAND-OUT Suggestion: choose another output layer besides just the last classification layer of your modele
@@ -405,8 +392,8 @@ def build_my_model(vargs):
 ## After training, make some predictions to assess your model's overall performance
 ## Note that detecting pneumonia is hard even for trained expert radiologists, 
 ## so there is no need to make the model perfect.
-my_model.load_weights(weight_path)
-pred_Y = new_model.predict(valX, batch_size=32, verbose=True)
+# my_model.load_weights(weight_path)
+# pred_Y = new_model.predict(valX, batch_size=32, verbose=True)
 
 
 # In[ ]:
@@ -479,6 +466,6 @@ def plot_auc(t_y, p_y):
 
 ## Just save model architecture to a .json:
 
-model_json = my_model.to_json()
+model_json = retrofitted_model.to_json()
 with open("my_model.json", "w") as json_file:
     json_file.write(model_json)
