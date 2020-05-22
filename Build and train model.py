@@ -7,7 +7,6 @@ import os
 from glob import glob
 # get_ipython().run_line_magic('matplotlib', 'inline')
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
 from sklearn.utils import shuffle
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
@@ -20,9 +19,8 @@ from tensorflow.keras.applications.vgg16 import preprocess_input
 from tensorflow.keras.initializers import GlorotNormal
 from itertools import chain
 from math import ceil
-from tqdm import tqdm
 import cv2 as cv
-from random import random, randrange, uniform, randint
+from random import uniform, randint
 
 batch_size = 16  # Used for training
 validation_batch_size = 64
@@ -56,8 +54,6 @@ all_xray_df['path'] = all_xray_df['Image Index'].map(all_image_paths.get)
 all_labels = np.unique(list(chain(*all_xray_df['Finding Labels'].map(lambda x: x.split('|')).tolist())))
 for c_label in all_labels:
     all_xray_df[c_label] = all_xray_df['Finding Labels'].map(lambda finding: 1 if c_label in finding else 0)
-
-
 # all_xray_df.sample(10)
 
 def split_dataset(dataset, test_size):
@@ -105,11 +101,8 @@ train_neg = len(train_df.Pneumonia) - train_pos
 class_weight = {1: float(train_neg) / (train_pos + train_neg), 0: float(train_pos) / (train_pos + train_neg)}
 
 
-## May want to look at some examples of our augmented training data.
-## This is helpful for understanding the extent to which data is being manipulated prior to training, 
-## and can be compared with how the raw data look prior to augmentation
-
 def perturbate_and_preprocess(image, data_format=None):
+    # TODO try also improving the image contrast/dynamic range; in case, it must be done in the validation dataset too
     flip = True
     stretch = .15  # Both vertical and horizontal
     shear = .05  # Horizontal only
@@ -131,8 +124,6 @@ def perturbate_and_preprocess(image, data_format=None):
     pts1 = np.float32([(0, 0), (0, cols - 1), (rows - 1, 0)])
     pts2 = np.float32([(-shift, 0), (shift, cols - 1), (rows - 1 - shift, 0)])
     shearing = cv.getAffineTransform(pts1, pts2)
-    # sh_x, sh_y = .2, 0
-    # shearing = np.array([[1, sh_y, 0], [sh_x, 1, 0]])
     image = cv.warpAffine(image, shearing, (rows, cols), flags=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT)
     # Rotate
     angle = uniform(-rotate, rotate)
@@ -149,14 +140,7 @@ def perturbate_and_preprocess(image, data_format=None):
 
 
 def make_train_gen(train_df, dataset_root, batch_size):
-    """idg = ImageDataGenerator(rotation_range=5,
-                             height_shift_range=.1,
-                             shear_range=.1,
-                             zoom_range=.2,
-                             horizontal_flip=True,"""
-
     idg = ImageDataGenerator(preprocessing_function=perturbate_and_preprocess)
-
     train_gen = idg.flow_from_dataframe(dataframe=train_df,
                                         directory=dataset_root,
                                         x_col='path',
@@ -165,13 +149,11 @@ def make_train_gen(train_df, dataset_root, batch_size):
                                         target_size=(224, 224),  # Input size for VGG16
                                         batch_size=batch_size,
                                         shuffle=True)
-
     return train_gen
 
 
 def make_val_gen(val_df, dataset_root, batch_size):
     idg = ImageDataGenerator(preprocessing_function=preprocess_input)
-
     val_gen = idg.flow_from_dataframe(dataframe=val_df,
                                       directory=dataset_root,
                                       x_col='path',
@@ -181,12 +163,15 @@ def make_val_gen(val_df, dataset_root, batch_size):
                                       batch_size=batch_size,
                                       shuffle=True
                                       )
-
     return val_gen
 
 
 train_gen = make_train_gen(train_df, dataset_root, batch_size)
 val_gen = make_val_gen(test_df, dataset_root, validation_batch_size)
+
+## May want to look at some examples of our augmented training data.
+## This is helpful for understanding the extent to which data is being manipulated prior to training,
+## and can be compared with how the raw data look prior to augmentation
 
 """t_x, t_y = next(train_gen)
 fig, m_axs = plt.subplots(4, 4, figsize=(16, 16))
@@ -245,7 +230,7 @@ if len(all_weights_paths) > 0:
     initial_epoch = int(latest_and_greatest[8:12])
     print('Resuming with epoch', initial_epoch + 1, 'from weights previously saved in', latest_and_greatest)
 
-optimizer = Adam(lr=1e-4)
+optimizer = Adam(lr=.5e-4)
 loss = tf.keras.losses.BinaryCrossentropy()
 metrics = [tf.keras.metrics.BinaryAccuracy(), tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
 
@@ -259,9 +244,9 @@ checkpoint = ModelCheckpoint(weight_path,
 
 early = EarlyStopping(monitor='val_loss',
                       mode='min',
-                      patience=16)
+                      patience=10)
 
-callbacks_list = [checkpoint, early]
+callbacks_list = [checkpoint]
 
 steps_per_epoch = ceil(len(train_df) * (1. + augmentation_rate) / batch_size)
 validation_steps = ceil(float(len(test_df)) / validation_batch_size)
@@ -359,50 +344,6 @@ def build_my_model(vargs):
 ## STAND-OUT Suggestion: choose another output layer besides just the last classification layer of your modele
 ## to output class activation maps to aid in clinical interpretation of your model's results
 
-
-# In[ ]:
-
-
-## Below is some helper code that will allow you to add checkpoints to your model,
-## This will save the 'best' version of your model by comparing it to previous epochs of training
-
-## Note that you need to choose which metric to monitor for your model's 'best' performance if using this code. 
-## The 'patience' parameter is set to 10, meaning that your model will train for ten epochs without seeing
-## improvement before quitting
-
-# Todo
-
-# weight_path="{}_my_model.best.hdf5".format('xray_class')
-
-# checkpoint = ModelCheckpoint(weight_path, 
-#                              monitor= CHOOSE_METRIC_TO_MONITOR_FOR_PERFORMANCE, 
-#                              verbose=1, 
-#                              save_best_only=True, 
-#                              mode= CHOOSE_MIN_OR_MAX_FOR_YOUR_METRIC, 
-#                              save_weights_only = True)
-
-# early = EarlyStopping(monitor= SAME_AS_METRIC_CHOSEN_ABOVE, 
-#                       mode= CHOOSE_MIN_OR_MAX_FOR_YOUR_METRIC, 
-#                       patience=10)
-
-# callbacks_list = [checkpoint, early]
-
-
-# ### Start training! 
-
-# In[ ]:
-
-
-## train your model
-
-# Todo
-
-# history = my_model.fit_generator(train_gen, 
-#                           validation_data = (valX, valY), 
-#                           epochs = , 
-#                           callbacks = callbacks_list)
-
-
 # ##### After training for some time, look at the performance of your model by plotting some performance statistics:
 # 
 # Note, these figures will come in handy for your FDA documentation later in the project
@@ -495,3 +436,13 @@ with open("my_model.json", "w") as json_file:
 # Screenshot from 2020-05-22 21-50-40 Added 3 layers with drop-off and image perturbation (no real augment)
 # Screenshot from 2020-05-22 22-14-27 Added fine tuning of the last 3 layers of VGG
 # Screenshot from 2020-05-22 23-28-32 Implemented my own image perturbation, best so far
+# Screenshot from 2020-05-23 01-17-48 Same but half learning rate
+# Screenshot from 2020-05-22 23-49-22 An additional 10 epochs after the above, overfitting
+# Screenshot from 2020-05-23 00-32-06 batch of 32 and 1-9 pos-neg, terrible
+
+# TODO
+"""Progressively reduce the learning rate, with a scheduler or ReduceLROnPlateau
+Verify what happens with proper distribution in validation set
+Add required charts and stats
+Find the right threashold as required
+"""
