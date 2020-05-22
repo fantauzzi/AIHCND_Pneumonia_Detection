@@ -21,9 +21,11 @@ from tensorflow.keras.initializers import GlorotNormal
 from itertools import chain
 from math import ceil
 from tqdm import tqdm
+import cv2 as cv
+from random import random, randrange, uniform, randint
 
 batch_size = 16  # Used for training
-validation_batch_size = 85
+validation_batch_size = 64
 initial_epoch = 0  # Used to resume training from a saved set of weights, if available
 n_epochs = 10  # Max number of epochs for training during the current run (i.e. counting after initial_epoch)
 augmentation_rate = 0  # Number of synthetic images that will be produced for every image in the training dataset
@@ -63,6 +65,7 @@ def split_dataset(dataset, test_size):
     pneumonia = 'Pneumonia'
     # For each patient, count how many positive samples in the dataset, and shuffle the resulting serie
     patient_positive_count = shuffle(all_xray_df.groupby(patient_id)[pneumonia].agg('sum'))
+    patient_positive_count.reset_index(inplace=True, drop=True)
     n_positive_samples = sum(dataset[pneumonia])
     n_wanted = int(n_positive_samples * test_size)
     selected_patients = set()
@@ -73,24 +76,14 @@ def split_dataset(dataset, test_size):
         if n_selected > n_wanted:
             break
     test_set = shuffle(dataset[dataset[patient_id].isin(selected_patients)])
+    test_set.reset_index(inplace=True, drop=True)
     training_set = shuffle(dataset[~dataset[patient_id].isin(selected_patients)])
+    training_set.reset_index(inplace=True, drop=True)
     assert len(training_set) + len(test_set) == len(dataset)
     return training_set, test_set
 
 
-"""def create_splits(data):
-    train_data, val_data = train_test_split(data,
-                                            test_size=.2,
-                                            stratify=data['Pneumonia'],
-                                            shuffle=True)
-
-    return train_data, val_data"""
-
 train_df, test_df = split_dataset(all_xray_df, .2)
-
-train_pos = sum(train_df.Pneumonia)
-train_neg = len(train_df.Pneumonia) - train_pos
-class_weight = {1: float(train_neg) / (train_pos + train_neg), 0: float(train_pos) / (train_pos + train_neg)}
 
 
 def enforce_classes_ratio(dataset_df, ratio):
@@ -104,66 +97,65 @@ def enforce_classes_ratio(dataset_df, ratio):
     return res_df
 
 
-# Reduce the training set removing enough negative cases to remain with a training set with 50% positive and 50% negative
-# train_df = enforce_classes_ratio(train_df, 1 + augmentation_rate)
-# test_df = enforce_classes_ratio(test_df, 3)
+train_df = enforce_classes_ratio(train_df, 4)
+test_df = enforce_classes_ratio(test_df, 4)
+
+train_pos = sum(train_df.Pneumonia)
+train_neg = len(train_df.Pneumonia) - train_pos
+class_weight = {1: float(train_neg) / (train_pos + train_neg), 0: float(train_pos) / (train_pos + train_neg)}
 
 
-# In[ ]:
-
-
-## May want to look at some examples of our augmented training data. 
+## May want to look at some examples of our augmented training data.
 ## This is helpful for understanding the extent to which data is being manipulated prior to training, 
 ## and can be compared with how the raw data look prior to augmentation
 
-def make_augmented_positive_images(dataset_df, augmentation_dir, augmentation_batch_size, augmentation_rate):
-    to_be_augmented = dataset_df[dataset_df.Pneumonia == 1]
+def perturbate_and_preprocess(image, data_format=None):
+    flip = True
+    stretch = .15  # Both vertical and horizontal
+    shear = .05  # Horizontal only
+    rotate = 7  # In degrees, positive is clockwise
+    translate_x = .05  # Fraction of the image width
+    translate_y = .0  # Fraction of the image height
 
-    augmented_idg = ImageDataGenerator(horizontal_flip=False,
-                                       vertical_flip=False,
-                                       height_shift_range=.1,
-                                       width_shift_range=.05,
-                                       rotation_range=7,
-                                       shear_range=0.2,
-                                       zoom_range=0.25)
-
-    augmentation_gen = augmented_idg.flow_from_dataframe(dataframe=to_be_augmented,
-                                                         directory=dataset_root,
-                                                         x_col='path',
-                                                         y_col='Pneumonia',
-                                                         class_mode='raw',  # TODO should I use binary instead?
-                                                         target_size=(224, 224),  # Input size for VGG16
-                                                         interpolation='bilinear',
-                                                         save_to_dir=augmentation_dir,
-                                                         save_prefix='augmented',
-                                                         save_format='png',
-                                                         batch_size=augmentation_batch_size)
-
-    how_many_wanted = augmentation_rate * len(to_be_augmented)
-    how_many_batches = how_many_wanted // augmentation_batch_size
-    print('Generating', how_many_batches, 'batches of', augmentation_batch_size, 'synthetic positive images each.',
-          flush=True)
-    for i in tqdm(range(how_many_batches)):
-        augmentation_gen.next()
-
-
-"""if len(glob(os.path.join(augmentation_dir + '/*.png'))) == 0 and augmentation_rate != 0:
-    make_augmented_positive_images(train_df, augmentation_dir, augmentation_batch_size, augmentation_rate)"""
-
-# Add augmented images to the training set
-"""all_image_paths = {os.path.basename(x): x for x in
-                   glob(os.path.join(augmentation_dir + '/*.png'))}
-
-all_1 = [1] * len(all_image_paths)
-additional_df = pd.DataFrame(data={'path': list(all_image_paths.values()), 'Pneumonia': all_1})
-# additional_df['path'] = all_image_paths
-train_df = train_df.append(additional_df)
-print('Loaded', len(additional_df), 'synthetic positive samples, added to training set.')
-print('Augmentation rate is set to', augmentation_rate, 'synthetic image(s) for every positive sample in training set.')"""
+    rows, cols = image.shape[0], image.shape[1]
+    # Flip
+    if flip and randint(0, 1) == 1:
+        image = cv.flip(image, 1)
+    # Stretch
+    s_x = uniform(1 - stretch, 1 + stretch)
+    s_y = uniform(1 - stretch, 1 + stretch)
+    stretching = np.array([[s_x, 0, 0], [0, s_y, 0]])
+    image = cv.warpAffine(image, stretching, (rows, cols), flags=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT)
+    # Shear
+    shift = cols * uniform(-shear, shear)
+    pts1 = np.float32([(0, 0), (0, cols - 1), (rows - 1, 0)])
+    pts2 = np.float32([(-shift, 0), (shift, cols - 1), (rows - 1 - shift, 0)])
+    shearing = cv.getAffineTransform(pts1, pts2)
+    # sh_x, sh_y = .2, 0
+    # shearing = np.array([[1, sh_y, 0], [sh_x, 1, 0]])
+    image = cv.warpAffine(image, shearing, (rows, cols), flags=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT)
+    # Rotate
+    angle = uniform(-rotate, rotate)
+    rotation = cv.getRotationMatrix2D(center=((cols - 1) / 2., (rows - 1) / 2.), angle=angle, scale=1.)
+    image = cv.warpAffine(image, rotation, (rows, cols), flags=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT)
+    # Translate
+    t_x = uniform(-cols * translate_x, cols * translate_x) + cols * (1 - s_x) / 2
+    t_y = uniform(-rows * translate_y, rows * translate_y) + rows * (1 - s_y) / 2
+    translation = np.array([[1, 0, t_x], [0, 1, t_y]])
+    image = cv.warpAffine(image, translation, (rows, cols), flags=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT)
+    # VGG16 pre-processing
+    image = preprocess_input(image, data_format)
+    return image
 
 
 def make_train_gen(train_df, dataset_root, batch_size):
-    idg = ImageDataGenerator(preprocessing_function=preprocess_input)
+    """idg = ImageDataGenerator(rotation_range=5,
+                             height_shift_range=.1,
+                             shear_range=.1,
+                             zoom_range=.2,
+                             horizontal_flip=True,"""
+
+    idg = ImageDataGenerator(preprocessing_function=perturbate_and_preprocess)
 
     train_gen = idg.flow_from_dataframe(dataframe=train_df,
                                         directory=dataset_root,
@@ -172,8 +164,7 @@ def make_train_gen(train_df, dataset_root, batch_size):
                                         class_mode='raw',  # TODO should I use binary instead?
                                         target_size=(224, 224),  # Input size for VGG16
                                         batch_size=batch_size,
-                                        shuffle=True
-                                        )
+                                        shuffle=True)
 
     return train_gen
 
@@ -218,7 +209,7 @@ transfer_layer = base_model.get_layer('block5_pool')
 vgg_model = Model(inputs=base_model.input,
                   outputs=transfer_layer.output)
 
-for layer in vgg_model.layers[0:17]:
+for layer in vgg_model.layers[0:14]:
     layer.trainable = False
 
 for layer in vgg_model.layers:
@@ -233,24 +224,20 @@ retrofitted_model.add(vgg_model)
 # convolutional layer.
 retrofitted_model.add(Flatten())
 
-"""retrofitted_model.add(Dropout(0.4))
-retrofitted_model.add(Dense(1024, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
-retrofitted_model.add(Dropout(0.4))
+retrofitted_model.add(Dropout(0.333))
+retrofitted_model.add(
+    Dense(1024, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+retrofitted_model.add(Dropout(0.333))
 retrofitted_model.add(Dense(512, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
-retrofitted_model.add(Dropout(0.4))
-retrofitted_model.add(Dense(256, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))"""
+retrofitted_model.add(Dropout(0.333))
+retrofitted_model.add(Dense(256, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
 retrofitted_model.add(
     Dense(1, activation='sigmoid', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
 
 retrofitted_model.summary()
 
-positive_training_count = sum(train_df.Pneumonia)
-positive_validation_count = sum(test_df.Pneumonia)
-
 all_weights_paths = {os.path.basename(x): x for x in
                      glob(os.path.join('weights', 'weights*.hdf5'))}
-
-# TODO latest = tf.train.latest_checkpoint(checkpoint_dir)
 
 if len(all_weights_paths) > 0:
     latest_and_greatest = max(all_weights_paths.keys())
@@ -279,20 +266,22 @@ callbacks_list = [checkpoint, early]
 steps_per_epoch = ceil(len(train_df) * (1. + augmentation_rate) / batch_size)
 validation_steps = ceil(float(len(test_df)) / validation_batch_size)
 
+val_pos = sum(test_df.Pneumonia)
+val_neg = len(test_df) - val_pos
+
 print()
 print('Training Set ---------------------------------')
-print('Positive samples {}'.format(positive_training_count))
-print('Negative samples {}'.format(len(train_df) - positive_training_count))
+print('Positive samples {}'.format(train_pos))
+print('Negative samples {}'.format(train_neg))
 print('Total samples {}'.format(len(train_df)))
-print('Total samples after augmentation {}'.format(steps_per_epoch*batch_size))
+print('Total samples after augmentation {}'.format(steps_per_epoch * batch_size))
+print('Augmentation rate {}'.format(augmentation_rate))
 print('Validation Set -------------------------------')
-print('Positive samples {}'.format(positive_validation_count))
-print('Negative samples {}'.format(len(test_df) - positive_validation_count))
-print('Total samples in batches {}'.format(validation_steps*validation_batch_size))
+print('Positive samples {}'.format(val_pos))
+print('Negative samples {}'.format(val_neg))
+print('Total samples in batches {}'.format(validation_steps * validation_batch_size))
 print('----------------------------------------------')
 print()
-
-
 
 history = retrofitted_model.fit(x=train_gen,
                                 class_weight=class_weight,
@@ -501,3 +490,8 @@ def plot_auc(t_y, p_y):
 model_json = retrofitted_model.to_json()
 with open("my_model.json", "w") as json_file:
     json_file.write(model_json)
+
+# Screenshot from 2020-05-22 21-07-46 1-4 pos-neg, only 1 layer, no augment
+# Screenshot from 2020-05-22 21-50-40 Added 3 layers with drop-off and image perturbation (no real augment)
+# Screenshot from 2020-05-22 22-14-27 Added fine tuning of the last 3 layers of VGG
+# Screenshot from 2020-05-22 23-28-32 Implemented my own image perturbation, best so far
