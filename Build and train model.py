@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+# !/usr/bin/env python
 # coding: utf-8
 
 import numpy as np
@@ -10,11 +10,11 @@ import matplotlib.pyplot as plt
 from sklearn.utils import shuffle
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, Flatten, Conv2D, MaxPooling2D
+from tensorflow.keras.layers import Dense, Dropout, Flatten
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.applications.vgg16 import VGG16
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ModelCheckpoint, LearningRateScheduler, EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.applications.vgg16 import preprocess_input
 from tensorflow.keras.initializers import GlorotNormal
 from itertools import chain
@@ -25,7 +25,7 @@ from random import uniform, randint
 batch_size = 16  # Used for training
 validation_batch_size = 64
 initial_epoch = 0  # Used to resume training from a saved set of weights, if available
-n_epochs = 10  # Max number of epochs for training during the current run (i.e. counting after initial_epoch)
+n_epochs = 20  # Max number of epochs for training during the current run (i.e. counting after initial_epoch)
 augmentation_rate = 0  # Number of synthetic images that will be produced for every image in the training dataset
 dataset_root = '/media/fanta/52A80B61A80B42C9/Users/fanta/datasets'
 augmentation_dir = dataset_root + '/data/augmented'  # TODO make it portable
@@ -54,6 +54,8 @@ all_xray_df['path'] = all_xray_df['Image Index'].map(all_image_paths.get)
 all_labels = np.unique(list(chain(*all_xray_df['Finding Labels'].map(lambda x: x.split('|')).tolist())))
 for c_label in all_labels:
     all_xray_df[c_label] = all_xray_df['Finding Labels'].map(lambda finding: 1 if c_label in finding else 0)
+
+
 # all_xray_df.sample(10)
 
 def split_dataset(dataset, test_size):
@@ -101,14 +103,23 @@ train_neg = len(train_df.Pneumonia) - train_pos
 class_weight = {1: float(train_neg) / (train_pos + train_neg), 0: float(train_pos) / (train_pos + train_neg)}
 
 
+def enhance_contrast(image):
+    image = np.uint8(image)
+    for channel in range(3):
+        image[:, :, channel] = cv.equalizeHist(image[:, :, channel])
+    image = np.float32(image)
+    return image
+
+
 def perturbate_and_preprocess(image, data_format=None):
-    # TODO try also improving the image contrast/dynamic range; in case, it must be done in the validation dataset too
     flip = True
     stretch = .15  # Both vertical and horizontal
     shear = .05  # Horizontal only
     rotate = 7  # In degrees, positive is clockwise
     translate_x = .05  # Fraction of the image width
     translate_y = .0  # Fraction of the image height
+
+    # image = enhance_contrast(image)
 
     rows, cols = image.shape[0], image.shape[1]
     # Flip
@@ -139,6 +150,12 @@ def perturbate_and_preprocess(image, data_format=None):
     return image
 
 
+def just_preprocess(image, data_format=None):
+    # image = enhance_contrast(image)
+    image = preprocess_input(image, data_format)
+    return image
+
+
 def make_train_gen(train_df, dataset_root, batch_size):
     idg = ImageDataGenerator(preprocessing_function=perturbate_and_preprocess)
     train_gen = idg.flow_from_dataframe(dataframe=train_df,
@@ -153,7 +170,7 @@ def make_train_gen(train_df, dataset_root, batch_size):
 
 
 def make_val_gen(val_df, dataset_root, batch_size):
-    idg = ImageDataGenerator(preprocessing_function=preprocess_input)
+    idg = ImageDataGenerator(preprocessing_function=just_preprocess)
     val_gen = idg.flow_from_dataframe(dataframe=val_df,
                                       directory=dataset_root,
                                       x_col='path',
@@ -173,7 +190,7 @@ val_gen = make_val_gen(test_df, dataset_root, validation_batch_size)
 ## This is helpful for understanding the extent to which data is being manipulated prior to training,
 ## and can be compared with how the raw data look prior to augmentation
 
-"""t_x, t_y = next(train_gen)
+t_x, t_y = next(train_gen)
 fig, m_axs = plt.subplots(4, 4, figsize=(16, 16))
 for (c_x, c_y, c_ax) in zip(t_x, t_y, m_axs.flatten()):
     c_ax.imshow(c_x[:, :, 0], cmap='bone')
@@ -183,58 +200,64 @@ for (c_x, c_y, c_ax) in zip(t_x, t_y, m_axs.flatten()):
         c_ax.set_title('No Pneumonia')
     c_ax.axis('off')
 
-plt.show()"""
+plt.show()
+
 
 # Build the model
+def make_model_vgg16():
+    base_model = VGG16(include_top=True, weights='imagenet')
+    base_model.summary()
 
-base_model = VGG16(include_top=True, weights='imagenet')
-base_model.summary()
+    transfer_layer = base_model.get_layer('block5_pool')
+    vgg_model = Model(inputs=base_model.input,
+                      outputs=transfer_layer.output)
 
-transfer_layer = base_model.get_layer('block5_pool')
-vgg_model = Model(inputs=base_model.input,
-                  outputs=transfer_layer.output)
+    for layer in vgg_model.layers[0:14]:
+        layer.trainable = False
 
-for layer in vgg_model.layers[0:14]:
-    layer.trainable = False
+    for layer in vgg_model.layers:
+        print(layer.name, layer.trainable)
 
-for layer in vgg_model.layers:
-    print(layer.name, layer.trainable)
+    retrofitted_model = Sequential()
 
-retrofitted_model = Sequential()
+    # Add the convolutional part of the VGG16 model from above.
+    retrofitted_model.add(vgg_model)
 
-# Add the convolutional part of the VGG16 model from above.
-retrofitted_model.add(vgg_model)
+    # Flatten the output of the VGG16 model because it is from a convolutional layer.
+    retrofitted_model.add(Flatten())
 
-# Flatten the output of the VGG16 model because it is from a
-# convolutional layer.
-retrofitted_model.add(Flatten())
+    retrofitted_model.add(Dropout(0.333))
+    retrofitted_model.add(
+        Dense(1024, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+    retrofitted_model.add(Dropout(0.333))
+    retrofitted_model.add(
+        Dense(512, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+    retrofitted_model.add(Dropout(0.333))
+    retrofitted_model.add(
+        Dense(256, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+    retrofitted_model.add(
+        Dense(1, activation='sigmoid', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+    return retrofitted_model
 
-retrofitted_model.add(Dropout(0.333))
-retrofitted_model.add(
-    Dense(1024, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
-retrofitted_model.add(Dropout(0.333))
-retrofitted_model.add(Dense(512, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
-retrofitted_model.add(Dropout(0.333))
-retrofitted_model.add(Dense(256, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
-retrofitted_model.add(
-    Dense(1, activation='sigmoid', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
 
-retrofitted_model.summary()
+the_model = make_model_vgg16()
+
+the_model.summary()
 
 all_weights_paths = {os.path.basename(x): x for x in
                      glob(os.path.join('weights', 'weights*.hdf5'))}
 
 if len(all_weights_paths) > 0:
     latest_and_greatest = max(all_weights_paths.keys())
-    retrofitted_model.load_weights(all_weights_paths[latest_and_greatest])
+    the_model.load_weights(all_weights_paths[latest_and_greatest])
     initial_epoch = int(latest_and_greatest[8:12])
     print('Resuming with epoch', initial_epoch + 1, 'from weights previously saved in', latest_and_greatest)
 
-optimizer = Adam(lr=.5e-4)
+optimizer = Adam(lr=1e-4)
 loss = tf.keras.losses.BinaryCrossentropy()
 metrics = [tf.keras.metrics.BinaryAccuracy(), tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
 
-retrofitted_model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+the_model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
 
 checkpoint = ModelCheckpoint(weight_path,
                              monitor='val_loss',
@@ -246,7 +269,13 @@ early = EarlyStopping(monitor='val_loss',
                       mode='min',
                       patience=10)
 
-callbacks_list = [checkpoint]
+reduce_LR = ReduceLROnPlateau(monitor='val_loss',
+                              factor=.2,
+                              patience=3,
+                              verbose=1,
+                              mode='auto')
+
+callbacks_list = [checkpoint, reduce_LR]
 
 steps_per_epoch = ceil(len(train_df) * (1. + augmentation_rate) / batch_size)
 validation_steps = ceil(float(len(test_df)) / validation_batch_size)
@@ -268,14 +297,14 @@ print('Total samples in batches {}'.format(validation_steps * validation_batch_s
 print('----------------------------------------------')
 print()
 
-history = retrofitted_model.fit(x=train_gen,
-                                class_weight=class_weight,
-                                steps_per_epoch=steps_per_epoch,
-                                validation_data=val_gen,
-                                validation_steps=validation_steps,
-                                initial_epoch=initial_epoch,
-                                epochs=initial_epoch + n_epochs,
-                                callbacks=callbacks_list)
+history = the_model.fit(x=train_gen,
+                        class_weight=class_weight,
+                        steps_per_epoch=steps_per_epoch,
+                        validation_data=val_gen,
+                        validation_steps=validation_steps,
+                        initial_epoch=initial_epoch,
+                        epochs=initial_epoch + n_epochs,
+                        callbacks=callbacks_list)
 
 
 # Define a function here that will plot loss, val_loss, binary_accuracy, and val_binary_accuracy over all of
@@ -320,7 +349,7 @@ def load_pretrained_model(vargs):
 
     # Todo
 
-    return vgg_model
+    return None
 
 
 # In[ ]:
@@ -428,7 +457,7 @@ def plot_auc(t_y, p_y):
 
 ## Just save model architecture to a .json:
 
-model_json = retrofitted_model.to_json()
+model_json = the_model.to_json()
 with open("my_model.json", "w") as json_file:
     json_file.write(model_json)
 
@@ -439,9 +468,12 @@ with open("my_model.json", "w") as json_file:
 # Screenshot from 2020-05-23 01-17-48 Same but half learning rate
 # Screenshot from 2020-05-22 23-49-22 An additional 10 epochs after the above, overfitting
 # Screenshot from 2020-05-23 00-32-06 batch of 32 and 1-9 pos-neg, terrible
-
+# Screenshot from 2020-05-23 09-33-09 same as "2020-05-22 23-28-32" but with lowering learning rate
+# Screenshot from 2020-05-23 10-45-20 Same as "2020-05-22 23-28-32" but with lowering learning rate, 20 epochs, best so far II
+# Screenshot from 2020-05-23 12-01-10 Same as above but with contrast enhancement. Not good.
 # TODO
-"""Progressively reduce the learning rate, with a scheduler or ReduceLROnPlateau
+"""
+Start with lower learning rate and progressively reduce it, with a scheduler or ReduceLROnPlateau
 Verify what happens with proper distribution in validation set
 Add required charts and stats
 Find the right threashold as required
