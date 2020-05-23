@@ -21,6 +21,8 @@ from itertools import chain
 from math import ceil
 import cv2 as cv
 from random import uniform, randint
+from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score, \
+    plot_precision_recall_curve, f1_score, confusion_matrix
 
 batch_size = 16  # Used for training
 validation_batch_size = 64
@@ -37,32 +39,38 @@ pd.set_option('display.max_rows', 100)
 n_gpus = len(tf.config.experimental.list_physical_devices('GPU'))
 assert n_gpus >= 1
 
-# Read the dataset metadata
-all_xray_df = pd.read_csv(dataset_root + '/data/Data_Entry_2017.csv')
-all_xray_df = all_xray_df.drop(columns=all_xray_df.columns[-1])
+
+def read_dataset_metadata(file_name):
+    # Read the dataset metadata
+    metedata = pd.read_csv(file_name)
+    metedata = metedata.drop(columns=metedata.columns[-1])
+    # all_xray_df.sample(10)
+
+    # Add a 'path' column to the metadata dataframe holding the full path to dataset images
+    all_image_paths = {os.path.basename(x): x for x in
+                       glob(os.path.join(dataset_root + '/data', 'images*', '*', '*.png'))}
+    print('Scans found:', len(all_image_paths), ', Total Headers', metedata.shape[0])
+    metedata['path'] = metedata['Image Index'].map(all_image_paths.get)
+
+    # One-hot encode the findings for each row in the metadata dataframe, adding more columns as needed
+    all_labels = np.unique(list(chain(*metedata['Finding Labels'].map(lambda x: x.split('|')).tolist())))
+    for c_label in all_labels:
+        metedata[c_label] = metedata['Finding Labels'].map(lambda finding: 1 if c_label in finding else 0)
+
+    return metedata
+
+
+metadata_df = read_dataset_metadata(dataset_root + '/data/Data_Entry_2017.csv')
+
+
 # all_xray_df.sample(10)
 
-# Add a 'path' column to the metadata dataframe holding the full path to dataset images
-all_image_paths = {os.path.basename(x): x for x in
-                   glob(os.path.join(dataset_root + '/data', 'images*', '*', '*.png'))}
-print('Scans found:', len(all_image_paths), ', Total Headers', all_xray_df.shape[0])
-all_xray_df['path'] = all_xray_df['Image Index'].map(all_image_paths.get)
-# l_xray_df.sample(3)
-
-
-# One-hot encode the findings for each row in the metadata dataframe, adding more columns as needed
-all_labels = np.unique(list(chain(*all_xray_df['Finding Labels'].map(lambda x: x.split('|')).tolist())))
-for c_label in all_labels:
-    all_xray_df[c_label] = all_xray_df['Finding Labels'].map(lambda finding: 1 if c_label in finding else 0)
-
-
-# all_xray_df.sample(10)
 
 def split_dataset(dataset, test_size):
     patient_id = 'Patient ID'
     pneumonia = 'Pneumonia'
     # For each patient, count how many positive samples in the dataset, and shuffle the resulting serie
-    patient_positive_count = shuffle(all_xray_df.groupby(patient_id)[pneumonia].agg('sum'))
+    patient_positive_count = shuffle(metadata_df.groupby(patient_id)[pneumonia].agg('sum'))
     patient_positive_count.reset_index(inplace=True, drop=True)
     n_positive_samples = sum(dataset[pneumonia])
     n_wanted = int(n_positive_samples * test_size)
@@ -81,22 +89,22 @@ def split_dataset(dataset, test_size):
     return training_set, test_set
 
 
-train_df, test_df = split_dataset(all_xray_df, .2)
+train_df, val_df = split_dataset(metadata_df, .2)
 
 
-def enforce_classes_ratio(dataset_df, ratio):
+def enforce_classes_ratio(metadata, ratio):
     # Reduce the training set removing enough negative cases to remain with a training set with 50% positive and 50% negative
-    count_train_pos = sum(dataset_df.Pneumonia)
+    count_train_pos = sum(metadata.Pneumonia)
 
-    res_df = dataset_df[dataset_df.Pneumonia == 0][:int(count_train_pos * ratio)].append(
-        dataset_df[dataset_df.Pneumonia == 1])
+    res_df = metadata[metadata.Pneumonia == 0][:int(count_train_pos * ratio)].append(
+        metadata[metadata.Pneumonia == 1])
     res_df = shuffle(res_df)
     res_df.reset_index(inplace=True, drop=True)
     return res_df
 
 
 train_df = enforce_classes_ratio(train_df, 4)
-test_df = enforce_classes_ratio(test_df, 4)
+val_df = enforce_classes_ratio(val_df, 4)
 
 train_pos = sum(train_df.Pneumonia)
 train_neg = len(train_df.Pneumonia) - train_pos
@@ -113,8 +121,8 @@ def enhance_contrast(image):
 
 def perturbate_and_preprocess(image, data_format=None):
     flip = True
-    stretch = .15  # Both vertical and horizontal
-    shear = .05  # Horizontal only
+    stretch = .15  # Both vertical and horizontal, fraction of the image height/width
+    shear = .05  # Horizontal only, fraction of the image width
     rotate = 7  # In degrees, positive is clockwise
     translate_x = .05  # Fraction of the image width
     translate_y = .0  # Fraction of the image height
@@ -145,14 +153,14 @@ def perturbate_and_preprocess(image, data_format=None):
     t_y = uniform(-rows * translate_y, rows * translate_y) + rows * (1 - s_y) / 2
     translation = np.array([[1, 0, t_x], [0, 1, t_y]])
     image = cv.warpAffine(image, translation, (rows, cols), flags=cv.INTER_LINEAR, borderMode=cv.BORDER_CONSTANT)
-    # VGG16 pre-processing
+    # VGG16 specific pre-processing
     image = preprocess_input(image, data_format)
     return image
 
 
 def just_preprocess(image, data_format=None):
     # image = enhance_contrast(image)
-    image = preprocess_input(image, data_format)
+    image = preprocess_input(image, data_format)  # VGG16 specific pre-processing
     return image
 
 
@@ -162,7 +170,7 @@ def make_train_gen(train_df, dataset_root, batch_size):
                                         directory=dataset_root,
                                         x_col='path',
                                         y_col='Pneumonia',
-                                        class_mode='raw',  # TODO should I use binary instead?
+                                        class_mode='raw',
                                         target_size=(224, 224),  # Input size for VGG16
                                         batch_size=batch_size,
                                         shuffle=True)
@@ -175,7 +183,7 @@ def make_val_gen(val_df, dataset_root, batch_size):
                                       directory=dataset_root,
                                       x_col='path',
                                       y_col='Pneumonia',
-                                      class_mode='raw',  # TODO should I use binary instead?
+                                      class_mode='raw',
                                       target_size=(224, 224),  # Input size for VGG16
                                       batch_size=batch_size,
                                       shuffle=True
@@ -184,13 +192,13 @@ def make_val_gen(val_df, dataset_root, batch_size):
 
 
 train_gen = make_train_gen(train_df, dataset_root, batch_size)
-val_gen = make_val_gen(test_df, dataset_root, validation_batch_size)
+val_gen = make_val_gen(val_df, dataset_root, validation_batch_size)
 
 ## May want to look at some examples of our augmented training data.
 ## This is helpful for understanding the extent to which data is being manipulated prior to training,
 ## and can be compared with how the raw data look prior to augmentation
 
-t_x, t_y = next(train_gen)
+"""t_x, t_y = next(train_gen)
 fig, m_axs = plt.subplots(4, 4, figsize=(16, 16))
 for (c_x, c_y, c_ax) in zip(t_x, t_y, m_axs.flatten()):
     c_ax.imshow(c_x[:, :, 0], cmap='bone')
@@ -200,7 +208,7 @@ for (c_x, c_y, c_ax) in zip(t_x, t_y, m_axs.flatten()):
         c_ax.set_title('No Pneumonia')
     c_ax.axis('off')
 
-plt.show()
+plt.show()"""
 
 
 # Build the model
@@ -212,6 +220,7 @@ def make_model_vgg16():
     vgg_model = Model(inputs=base_model.input,
                       outputs=transfer_layer.output)
 
+    # Fine tune the last 3 convolutional layers of VGG16
     for layer in vgg_model.layers[0:14]:
         layer.trainable = False
 
@@ -244,67 +253,23 @@ the_model = make_model_vgg16()
 
 the_model.summary()
 
-all_weights_paths = {os.path.basename(x): x for x in
-                     glob(os.path.join('weights', 'weights*.hdf5'))}
 
-if len(all_weights_paths) > 0:
-    latest_and_greatest = max(all_weights_paths.keys())
-    the_model.load_weights(all_weights_paths[latest_and_greatest])
-    initial_epoch = int(latest_and_greatest[8:12])
+def load_latest_weights(model, dir):
+    all_weights_paths = {os.path.basename(x): x for x in
+                         glob(os.path.join(dir, 'weights*.hdf5'))}
+
+    if len(all_weights_paths) > 0:
+        latest_file_name = max(all_weights_paths.keys())
+        model.load_weights(all_weights_paths[latest_file_name])
+        epoch = int(latest_file_name[8:12])
+        return epoch, latest_file_name
+
+    return 0, None
+
+
+initial_epoch, latest_and_greatest = load_latest_weights(the_model, dir='weights')
+if initial_epoch > 0:
     print('Resuming with epoch', initial_epoch + 1, 'from weights previously saved in', latest_and_greatest)
-
-optimizer = Adam(lr=1e-4)
-loss = tf.keras.losses.BinaryCrossentropy()
-metrics = [tf.keras.metrics.BinaryAccuracy(), tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
-
-the_model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
-
-checkpoint = ModelCheckpoint(weight_path,
-                             monitor='val_loss',
-                             verbose=1,
-                             save_best_only=False,
-                             save_weights_only=True)
-
-early = EarlyStopping(monitor='val_loss',
-                      mode='min',
-                      patience=10)
-
-reduce_LR = ReduceLROnPlateau(monitor='val_loss',
-                              factor=.2,
-                              patience=3,
-                              verbose=1,
-                              mode='auto')
-
-callbacks_list = [checkpoint, reduce_LR]
-
-steps_per_epoch = ceil(len(train_df) * (1. + augmentation_rate) / batch_size)
-validation_steps = ceil(float(len(test_df)) / validation_batch_size)
-
-val_pos = sum(test_df.Pneumonia)
-val_neg = len(test_df) - val_pos
-
-print()
-print('Training Set ---------------------------------')
-print('Positive samples {}'.format(train_pos))
-print('Negative samples {}'.format(train_neg))
-print('Total samples {}'.format(len(train_df)))
-print('Total samples after augmentation {}'.format(steps_per_epoch * batch_size))
-print('Augmentation rate {}'.format(augmentation_rate))
-print('Validation Set -------------------------------')
-print('Positive samples {}'.format(val_pos))
-print('Negative samples {}'.format(val_neg))
-print('Total samples in batches {}'.format(validation_steps * validation_batch_size))
-print('----------------------------------------------')
-print()
-
-history = the_model.fit(x=train_gen,
-                        class_weight=class_weight,
-                        steps_per_epoch=steps_per_epoch,
-                        validation_data=val_gen,
-                        validation_steps=validation_steps,
-                        initial_epoch=initial_epoch,
-                        epochs=initial_epoch + n_epochs,
-                        callbacks=callbacks_list)
 
 
 # Define a function here that will plot loss, val_loss, binary_accuracy, and val_binary_accuracy over all of
@@ -338,36 +303,65 @@ def plot_history(history):
     ax2.legend(loc='center right')
 
 
-plot_history(history)
-plt.show()
+if False:
+    val_pos = sum(val_df.Pneumonia)
+    val_neg = len(val_df) - val_pos
+    steps_per_epoch = ceil(len(train_df) * (1. + augmentation_rate) / batch_size)
+    validation_steps = ceil(float(len(val_df)) / validation_batch_size)
 
+    print()
+    print('Training Set ---------------------------------')
+    print('Positive samples {}'.format(train_pos))
+    print('Negative samples {}'.format(train_neg))
+    print('Total samples {}'.format(len(train_df)))
+    print('Total samples after augmentation {}'.format(steps_per_epoch * batch_size))
+    print('Augmentation rate {}'.format(augmentation_rate))
+    print('Validation Set -------------------------------')
+    print('Positive samples {}'.format(val_pos))
+    print('Negative samples {}'.format(val_neg))
+    print('Total samples in batches {}'.format(validation_steps * validation_batch_size))
+    print('----------------------------------------------')
+    print()
 
-def load_pretrained_model(vargs):
-    # model = VGG16(include_top=True, weights='imagenet')
-    # transfer_layer = model.get_layer(lay_of_interest)
-    # vgg_model = Model(inputs = model.input, outputs = transfer_layer.output)
+    optimizer = Adam(lr=1e-4)
+    loss = tf.keras.losses.BinaryCrossentropy()
+    metrics = [tf.keras.metrics.BinaryAccuracy(), tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
 
-    # Todo
+    the_model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
 
-    return None
+    checkpoint = ModelCheckpoint(weight_path,
+                                 monitor='val_loss',
+                                 verbose=1,
+                                 save_best_only=False,
+                                 save_weights_only=True)
 
+    early = EarlyStopping(monitor='val_loss',
+                          mode='min',
+                          patience=10)
 
-# In[ ]:
+    reduce_LR = ReduceLROnPlateau(monitor='val_loss',
+                                  factor=.2,
+                                  patience=3,
+                                  verbose=1,
+                                  mode='auto')
 
+    callbacks_list = [checkpoint, reduce_LR]
 
-def build_my_model(vargs):
-    # my_model = Sequential()
-    # ....add your pre-trained model, and then whatever additional layers you think you might
-    # want for fine-tuning (Flatteen, Dense, Dropout, etc.)
+    history = the_model.fit(x=train_gen,
+                            class_weight=class_weight,
+                            steps_per_epoch=steps_per_epoch,
+                            validation_data=val_gen,
+                            validation_steps=validation_steps,
+                            initial_epoch=initial_epoch,
+                            epochs=initial_epoch + n_epochs,
+                            callbacks=callbacks_list)
 
-    # if you want to compile your model within this function, consider which layers of your pre-trained model, 
-    # you want to freeze before you compile 
+    model_json = the_model.to_json()
+    with open("my_model.json", "w") as json_file:
+        json_file.write(model_json)
 
-    # also make sure you set your optimizer, loss function, and metrics to monitor
-
-    # Todo
-
-    return None
+    plot_history(history)
+    plt.show()
 
 
 ## STAND-OUT Suggestion: choose another output layer besides just the last classification layer of your modele
@@ -383,33 +377,35 @@ def build_my_model(vargs):
 ## After training, make some predictions to assess your model's overall performance
 ## Note that detecting pneumonia is hard even for trained expert radiologists, 
 ## so there is no need to make the model perfect.
-# my_model.load_weights(weight_path)
-# pred_Y = new_model.predict(valX, batch_size=32, verbose=True)
 
 
 # In[ ]:
 
 
 def plot_auc(t_y, p_y):
-    ## Hint: can use scikit-learn's built in functions here like roc_curve
-
-    # Todo
-
-    return
+    fig, c_ax = plt.subplots(1, 1, figsize=(9, 9))
+    fpr, tpr, thresholds = roc_curve(t_y, p_y)
+    c_ax.plot(fpr, tpr, label='%s (AUC:%0.2f)' % ('Pneumonia', auc(fpr, tpr)))
+    c_ax.legend()
+    c_ax.set_xlabel('False Positive Rate')
+    c_ax.set_ylabel('True Positive Rate')
 
 
 ## what other performance statistics do you want to include here besides AUC?
 
 
-# def ... 
-# Todo
+def plot_pr(t_y, p_y):
+    fig, c_ax = plt.subplots(1, 1, figsize=(9, 9))
+    precision, recall, thresholds = precision_recall_curve(t_y, p_y)
+    c_ax.plot(precision, recall, label='%s (AP Score:%0.2f)' % ('Pneumonia', average_precision_score(t_y, p_y)))
+    c_ax.legend()
+    c_ax.set_xlabel('Recall')
+    c_ax.set_ylabel('Precision')
 
-# def ...
-# Todo
 
-
-# In[ ]:
-
+# my_model.load_weights(weight_path)
+pred_df = the_model.predict(val_df, batch_size=validation_batch_size, verbose=True)
+pass
 
 ## plot figures
 
@@ -457,9 +453,6 @@ def plot_auc(t_y, p_y):
 
 ## Just save model architecture to a .json:
 
-model_json = the_model.to_json()
-with open("my_model.json", "w") as json_file:
-    json_file.write(model_json)
 
 # Screenshot from 2020-05-22 21-07-46 1-4 pos-neg, only 1 layer, no augment
 # Screenshot from 2020-05-22 21-50-40 Added 3 layers with drop-off and image perturbation (no real augment)
