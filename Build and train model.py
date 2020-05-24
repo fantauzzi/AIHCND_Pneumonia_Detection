@@ -13,23 +13,30 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.layers import Dense, Dropout, Flatten
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.applications.vgg16 import VGG16
+from tensorflow.keras.applications.resnet50 import ResNet50
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.applications.vgg16 import preprocess_input
-from tensorflow.keras.initializers import GlorotNormal
+# from tensorflow_addons.metrics import F1Score
+# from tensorflow.keras.applications.vgg16 import preprocess_input
+# from tensorflow.keras.applications.resnet50 import preprocess_input
+# from tensorflow.keras.applications.densenet import preprocess_input
+from tensorflow.keras.applications.densenet import DenseNet121
+from tensorflow.keras.initializers import constant
 from itertools import chain
 from math import ceil
 import cv2 as cv
 from random import uniform, randint
 from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score, \
     plot_precision_recall_curve, f1_score, confusion_matrix
+import datetime
 
-batch_size = 16  # Used for training
+batch_size = 24  # Used for training
 validation_batch_size = 64
-initial_epoch = 0  # Used to resume training from a saved set of weights, if available
 n_epochs = 20  # Max number of epochs for training during the current run (i.e. counting after initial_epoch)
-augmentation_rate = 0  # Number of synthetic images that will be produced for every image in the training dataset
+initial_learning_rate = 1e-5
+augmentation_rate = 1  # Number of synthetic images that will be produced for every image in the training dataset
 dataset_root = '/media/fanta/52A80B61A80B42C9/Users/fanta/datasets'
+log_dir = "logs/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 augmentation_dir = dataset_root + '/data/augmented'  # TODO make it portable
 augmentation_batch_size = 229  # A divisor of 2290, the number of positive images in the dataset
 weight_path = 'weights/weights.{epoch:04d}-{val_loss:.2f}.hdf5'
@@ -42,22 +49,23 @@ assert n_gpus >= 1
 
 def read_dataset_metadata(file_name):
     # Read the dataset metadata
-    metedata = pd.read_csv(file_name)
-    metedata = metedata.drop(columns=metedata.columns[-1])
+    metadata = pd.read_csv(file_name)
+    metadata = metadata.drop(columns=metadata.columns[-1])
     # all_xray_df.sample(10)
 
     # Add a 'path' column to the metadata dataframe holding the full path to dataset images
     all_image_paths = {os.path.basename(x): x for x in
                        glob(os.path.join(dataset_root + '/data', 'images*', '*', '*.png'))}
-    print('Scans found:', len(all_image_paths), ', Total Headers', metedata.shape[0])
-    metedata['path'] = metedata['Image Index'].map(all_image_paths.get)
+    print('Scans found:', len(all_image_paths), ', Total Headers', metadata.shape[0])
+    metadata['path'] = metadata['Image Index'].map(all_image_paths.get)
 
     # One-hot encode the findings for each row in the metadata dataframe, adding more columns as needed
-    all_labels = np.unique(list(chain(*metedata['Finding Labels'].map(lambda x: x.split('|')).tolist())))
+    all_labels = np.unique(list(chain(*metadata['Finding Labels'].map(lambda x: x.split('|')).tolist())))
     for c_label in all_labels:
-        metedata[c_label] = metedata['Finding Labels'].map(lambda finding: 1 if c_label in finding else 0)
+        metadata[c_label] = metadata['Finding Labels'].map(lambda finding: 1 if c_label in finding else 0)
+    metadata['class'] = metadata.Pneumonia.map(lambda value: "1" if value == 1 else "0")
 
-    return metedata
+    return metadata
 
 
 metadata_df = read_dataset_metadata(dataset_root + '/data/Data_Entry_2017.csv')
@@ -103,8 +111,21 @@ def enforce_classes_ratio(metadata, ratio):
     return res_df
 
 
-train_df = enforce_classes_ratio(train_df, 4)
+train_df = enforce_classes_ratio(train_df, 3)
 val_df = enforce_classes_ratio(val_df, 4)
+
+
+def augment_dataset(dataset, ratio):
+    result = dataset.copy()
+    for i in range(ratio):
+        result = result.append(dataset)
+    shuffle(result)
+    result.reset_index(inplace=True, drop=True)
+    return result
+
+
+if augmentation_rate > 0:
+    train_df = augment_dataset(train_df, augmentation_rate)
 
 train_pos = sum(train_df.Pneumonia)
 train_neg = len(train_df.Pneumonia) - train_pos
@@ -119,11 +140,15 @@ def enhance_contrast(image):
     return image
 
 
+def preprocess_input(image, data_format=None):
+    return image / 255.
+
+
 def perturbate_and_preprocess(image, data_format=None):
     flip = True
-    stretch = .15  # Both vertical and horizontal, fraction of the image height/width
+    stretch = .2  # Both vertical and horizontal, fraction of the image height/width
     shear = .05  # Horizontal only, fraction of the image width
-    rotate = 7  # In degrees, positive is clockwise
+    rotate = 5  # In degrees
     translate_x = .05  # Fraction of the image width
     translate_y = .0  # Fraction of the image height
 
@@ -169,8 +194,8 @@ def make_train_gen(train_df, dataset_root, batch_size):
     train_gen = idg.flow_from_dataframe(dataframe=train_df,
                                         directory=dataset_root,
                                         x_col='path',
-                                        y_col='Pneumonia',
-                                        class_mode='raw',
+                                        y_col='class',
+                                        class_mode='binary',
                                         target_size=(224, 224),  # Input size for VGG16
                                         batch_size=batch_size,
                                         shuffle=True)
@@ -182,8 +207,8 @@ def make_val_gen(val_df, dataset_root, batch_size):
     val_gen = idg.flow_from_dataframe(dataframe=val_df,
                                       directory=dataset_root,
                                       x_col='path',
-                                      y_col='Pneumonia',
-                                      class_mode='raw',
+                                      y_col='class',
+                                      class_mode='binary',
                                       target_size=(224, 224),  # Input size for VGG16
                                       batch_size=batch_size,
                                       shuffle=True
@@ -211,8 +236,72 @@ for (c_x, c_y, c_ax) in zip(t_x, t_y, m_axs.flatten()):
 plt.show()"""
 
 
+def make_model_DenseNet121(output_bias_init=None):
+    retrofitted_model = Sequential()
+
+    base_model = DenseNet121(include_top=False, pooling='avg', weights='imagenet', input_shape=(224, 224, 3))
+    base_model.summary()
+
+    for layer in base_model.layers[0:313]:
+        layer.trainable = False
+
+    for layer in base_model.layers:
+        print(layer.name, layer.trainable)
+
+    # 1st layer as the lumpsum weights from resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5
+    # NOTE that this layer will be set below as NOT TRAINABLE, i.e., use it as is
+    retrofitted_model.add(base_model)
+
+    # retrofitted_model.add(Dropout(0.333))
+    # retrofitted_model.add(Dense(1024, activation='relu'))
+    retrofitted_model.add(Dropout(0.333))
+    retrofitted_model.add(Dense(512, activation='relu'))
+    retrofitted_model.add(Dropout(0.333))
+    retrofitted_model.add(Dense(256, activation='relu'))
+    # 2nd layer as Dense for 2-class classification, i.e., dog or cat using SoftMax activation
+    # retrofitted_model.add(Dense(2, activation='softmax'))"""
+    retrofitted_model.add(Dense(1, activation='sigmoid', bias_initializer=output_bias_init))
+
+    # Say not to train first layer (ResNet) model as it is already trained
+    # retrofitted_model.layers[0].trainable = False
+
+    return retrofitted_model
+
+
+def make_model_RESNET50(output_bias_init=None):
+    retrofitted_model = Sequential()
+
+    base_model = ResNet50(include_top=False, pooling='avg', weights='imagenet', input_shape=(224, 224, 3))
+    base_model.summary()
+
+    for layer in base_model.layers[0:143]:
+        layer.trainable = False
+
+    for layer in base_model.layers:
+        print(layer.name, layer.trainable)
+
+    # 1st layer as the lumpsum weights from resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5
+    # NOTE that this layer will be set below as NOT TRAINABLE, i.e., use it as is
+    retrofitted_model.add(base_model)
+
+    retrofitted_model.add(Dropout(0.333))
+    retrofitted_model.add(Dense(1024, activation='relu'))
+    retrofitted_model.add(Dropout(0.333))
+    retrofitted_model.add(Dense(512, activation='relu'))
+    retrofitted_model.add(Dropout(0.333))
+    retrofitted_model.add(Dense(256, activation='relu'))
+    # 2nd layer as Dense for 2-class classification, i.e., dog or cat using SoftMax activation
+    # retrofitted_model.add(Dense(2, activation='softmax'))
+    retrofitted_model.add(Dense(1, activation='sigmoid', bias_initializer=output_bias_init))
+
+    # Say not to train first layer (ResNet) model as it is already trained
+    # retrofitted_model.layers[0].trainable = False
+
+    return retrofitted_model
+
+
 # Build the model
-def make_model_vgg16():
+def make_model_VGG16(output_bias_init=None):
     base_model = VGG16(include_top=True, weights='imagenet')
     base_model.summary()
 
@@ -236,20 +325,17 @@ def make_model_vgg16():
     retrofitted_model.add(Flatten())
 
     retrofitted_model.add(Dropout(0.333))
-    retrofitted_model.add(
-        Dense(1024, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+    retrofitted_model.add(Dense(1024, activation='relu'))
     retrofitted_model.add(Dropout(0.333))
-    retrofitted_model.add(
-        Dense(512, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+    retrofitted_model.add(Dense(512, activation='relu'))
     retrofitted_model.add(Dropout(0.333))
-    retrofitted_model.add(
-        Dense(256, activation='relu', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
-    retrofitted_model.add(
-        Dense(1, activation='sigmoid', kernel_initializer=GlorotNormal(), bias_initializer=GlorotNormal()))
+    retrofitted_model.add(Dense(256, activation='relu'))
+    retrofitted_model.add(Dense(1, activation='sigmoid', bias_initializer=output_bias_init))
     return retrofitted_model
 
 
-the_model = make_model_vgg16()
+# the_model = make_model_VGG16(constant(np.log([train_pos / train_neg])))
+the_model = make_model_DenseNet121(constant(np.log([train_pos / train_neg])))
 
 the_model.summary()
 
@@ -303,11 +389,11 @@ def plot_history(history):
     ax2.legend(loc='center right')
 
 
-if False:
+if True:
     val_pos = sum(val_df.Pneumonia)
     val_neg = len(val_df) - val_pos
-    steps_per_epoch = ceil(len(train_df) * (1. + augmentation_rate) / batch_size)
-    validation_steps = ceil(float(len(val_df)) / validation_batch_size)
+    steps_per_epoch = ceil(len(train_df) / batch_size)
+    validation_steps = ceil(len(val_df) / validation_batch_size)
 
     print()
     print('Training Set ---------------------------------')
@@ -323,9 +409,9 @@ if False:
     print('----------------------------------------------')
     print()
 
-    optimizer = Adam(lr=1e-4)
+    optimizer = Adam(lr=initial_learning_rate)
     loss = tf.keras.losses.BinaryCrossentropy()
-    metrics = [tf.keras.metrics.BinaryAccuracy(), tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
+    metrics = [tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
 
     the_model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
 
@@ -341,11 +427,13 @@ if False:
 
     reduce_LR = ReduceLROnPlateau(monitor='val_loss',
                                   factor=.2,
-                                  patience=3,
+                                  patience=4,
                                   verbose=1,
                                   mode='auto')
 
-    callbacks_list = [checkpoint, reduce_LR]
+    tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
+
+    callbacks_list = [checkpoint, reduce_LR, tensorboard_cb]
 
     history = the_model.fit(x=train_gen,
                             class_weight=class_weight,
@@ -404,8 +492,16 @@ def plot_pr(t_y, p_y):
 
 
 # my_model.load_weights(weight_path)
-pred_df = the_model.predict(val_df, batch_size=validation_batch_size, verbose=True)
-pass
+pred_val_gen = make_val_gen(val_df, dataset_root, validation_batch_size)
+
+pred_df = the_model.predict(pred_val_gen, batch_size=validation_batch_size, verbose=1)
+pred_df = np.squeeze(pred_df)
+
+plot_auc(val_df.Pneumonia, pred_df)
+plt.show()
+
+plot_pr(val_df.Pneumonia, pred_df)
+plt.show()
 
 ## plot figures
 
@@ -464,10 +560,12 @@ pass
 # Screenshot from 2020-05-23 09-33-09 same as "2020-05-22 23-28-32" but with lowering learning rate
 # Screenshot from 2020-05-23 10-45-20 Same as "2020-05-22 23-28-32" but with lowering learning rate, 20 epochs, best so far II
 # Screenshot from 2020-05-23 12-01-10 Same as above but with contrast enhancement. Not good.
+# Screenshot from 2020-05-23 20-30-36 Same as "2020-05-23 10-45-20" but F1 not as good
+# Screenshot from 2020-05-24 15-04-57 Best so far, with DenseNet + augmentation but 1-1 pos-neg in the validation set. Saved weights and logs
 # TODO
 """
-Start with lower learning rate and progressively reduce it, with a scheduler or ReduceLROnPlateau
-Verify what happens with proper distribution in validation set
-Add required charts and stats
-Find the right threashold as required
+Try with 1-to-1 classes ratio in training (doing it in the cloud, it seems good! But its evaluation is misleading!)
+Prova con Densenet
+Usare due classi con softmax per la classificazione finale?
+
 """
